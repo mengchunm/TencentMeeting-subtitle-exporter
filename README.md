@@ -1,4 +1,4 @@
-# 腾讯会议字幕导出 (Tencent Meeting SRT Exporter)
+# 腾讯会议字幕导出 (TencentMeeting-subtitle-exporter)
 
 一个基于 **Tampermonkey** 的用户脚本，用于在 [腾讯会议](https://meeting.tencent.com) 的回放页面中 **一键导出字幕** 并保存为 **SRT 格式** 文件，方便二次使用或存档。
 
