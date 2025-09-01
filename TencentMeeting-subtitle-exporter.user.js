@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         腾讯会议字幕导出 
+// @name         腾讯会议字幕导出
 // @namespace    http://tampermonkey.net/
-// @version      4.4
-// @description  导出腾讯会议保存视频字幕保存导出为SRT格式
+// @version      5.0
+// @description  修改流程，读取字幕后直接选择格式导出，无需确认，并可重复导出不同格式。
 // @match        https://meeting.tencent.com/cw/*
 // @grant        none
 // @downloadURL  https://raw.githubusercontent.com/mengchunm/TencentMeeting-subtitle-exporter/main/TencentMeeting-subtitle-exporter.user.js
@@ -16,10 +16,24 @@
     // 填入字幕列表容器的 CSS 选择器
     const YOUR_SELECTOR = '.minutes-module-list';
 
-    let finalSRTContent = '';
+    let subtitlesData = []; // 用于存储读取后的字幕数据
     let uiInjected = false;
     let appContext = null;
     const ui = {};
+
+    // 重置UI到初始状态
+    function resetUI() {
+        if (!ui.readButton) return;
+        ui.readButton.style.display = 'block';
+        ui.readButton.disabled = false;
+        ui.readButton.textContent = '读取字幕';
+
+        ui.exportSrtButton.style.display = 'none';
+        ui.exportTxtButton.style.display = 'none';
+        ui.progressBarContainer.style.display = 'none';
+
+        subtitlesData = [];
+    }
 
     // 注入导出控件
     function initializeUI(doc) {
@@ -33,15 +47,37 @@
             fontFamily: 'sans-serif', width: '160px', textAlign: 'center'
         });
 
-        // 导出按钮
-        ui.exportButton = doc.createElement('button');
-        ui.exportButton.textContent = '导出SRT字幕';
-        Object.assign(ui.exportButton.style, {
+        // 读取/重新读取字幕按钮
+        ui.readButton = doc.createElement('button');
+        ui.readButton.textContent = '读取字幕';
+        Object.assign(ui.readButton.style, {
             display: 'block', width: '100%', padding: '10px',
             backgroundColor: '#007bff', color: 'white',
+            borderRadius: '5px', cursor: 'pointer', fontSize: '14px', border: 'none',
+            marginBottom: '8px'
+        });
+        ui.readButton.onclick = startReadingSubtitles;
+
+        // 导出SRT按钮
+        ui.exportSrtButton = doc.createElement('button');
+        ui.exportSrtButton.textContent = '导出SRT字幕';
+        Object.assign(ui.exportSrtButton.style, {
+            display: 'none', width: '100%', padding: '10px', // Initially hidden
+            backgroundColor: '#007bff', color: 'white',
+            borderRadius: '5px', cursor: 'pointer', fontSize: '14px', border: 'none',
+            marginBottom: '8px'
+        });
+        ui.exportSrtButton.onclick = () => exportAndDownload('srt');
+
+        // 导出TXT按钮
+        ui.exportTxtButton = doc.createElement('button');
+        ui.exportTxtButton.textContent = '导出TXT文本';
+        Object.assign(ui.exportTxtButton.style, {
+            display: 'none', width: '100%', padding: '10px', // Initially hidden
+            backgroundColor: '#17a2b8', color: 'white',
             borderRadius: '5px', cursor: 'pointer', fontSize: '14px', border: 'none'
         });
-        ui.exportButton.onclick = exportSubtitlesToSRT;
+        ui.exportTxtButton.onclick = () => exportAndDownload('txt');
 
         // 进度条
         ui.progressBarContainer = doc.createElement('div');
@@ -66,20 +102,10 @@
         ui.progressBarContainer.appendChild(ui.progressText);
         ui.progressBarContainer.appendChild(progressBar);
 
-        // 下载按钮
-        ui.downloadButton = doc.createElement('button');
-        ui.downloadButton.textContent = '下载字幕';
-        Object.assign(ui.downloadButton.style, {
-            display: 'none', width: '100%', padding: '10px',
-            backgroundColor: '#28a745', color: 'white',
-            borderRadius: '5px', cursor: 'pointer', fontSize: '14px',
-            marginTop: '10px', border: 'none'
-        });
-        ui.downloadButton.onclick = downloadSRTFile;
-
-        controlsContainer.appendChild(ui.exportButton);
+        controlsContainer.appendChild(ui.readButton);
+        controlsContainer.appendChild(ui.exportSrtButton);
+        controlsContainer.appendChild(ui.exportTxtButton);
         controlsContainer.appendChild(ui.progressBarContainer);
-        controlsContainer.appendChild(ui.downloadButton);
         doc.body.appendChild(controlsContainer);
         console.log('字幕导出控件已注入');
     }
@@ -99,66 +125,103 @@
         return { start: formatSRTTime(startMs), end: formatSRTTime(endMs) };
     }
 
-    // 导出字幕内容
-    function exportSubtitlesToSRT() {
-        if (!appContext) return alert('脚本上下文丢失，请刷新页面！');
-
-        ui.exportButton.disabled = true;
-        ui.exportButton.textContent = '正在加载...';
-        ui.progressBarContainer.style.display = 'block';
-        ui.downloadButton.style.display = 'none';
-        ui.progressFill.style.width = '0%';
-        ui.progressText.textContent = '加载进度: 0%';
-
-        const container = appContext.querySelector(YOUR_SELECTOR);
-        if (!container) {
-            alert('错误：未找到字幕容器');
-            ui.exportButton.disabled = false;
-            ui.exportButton.textContent = '导出SRT字幕';
-            ui.progressBarContainer.style.display = 'none';
+    // 生成内容并直接触发下载
+    function exportAndDownload(format) {
+        if (subtitlesData.length === 0) {
+            alert('没有已读取的字幕数据，请先读取字幕。');
             return;
         }
 
-        const allSubtitles = new Map();
-        let lastScrollTop = -1; // 用于检测滚动是否卡住
-
-        const processAndFinalize = () => {
-            const finalSubtitles = Array.from(allSubtitles.values())
-                .sort((a, b) => a.pid - b.pid || a.sid - b.sid);
-
-            let srtContent = '';
+        let generatedContent = '';
+        if (format === 'srt') {
             let seq = 1;
-            finalSubtitles.forEach(s => {
+            subtitlesData.forEach(s => {
                 if (s.timeOffset && s.text.trim()) {
                     try {
                         const { start, end } = parseTimeOffset(s.timeOffset);
-                        srtContent += `${seq++}\n${start} --> ${end}\n${s.text.trim()}\n\n`;
+                        generatedContent += `${seq++}\n${start} --> ${end}\n${s.text.trim()}\n\n`;
                     } catch (e) {
                         console.warn(`解析时间失败: ${s.timeOffset}`, e);
                     }
                 }
             });
+        } else if (format === 'txt') {
+             subtitlesData.forEach(s => {
+                if (s.text.trim()) {
+                   generatedContent += `${s.text.trim()}\n`;
+                }
+            });
+        }
 
-            if (!srtContent.trim()) {
-                alert('未能生成SRT内容，请检查字幕数据');
-                ui.exportButton.disabled = false;
-                ui.exportButton.textContent = '导出SRT字幕';
-                ui.exportButton.style.display = 'block';
-                ui.progressBarContainer.style.display = 'none';
+        if (!generatedContent.trim()) {
+            alert('未能生成任何内容，请检查字幕数据');
+            return;
+        }
+        
+        downloadFile(format, generatedContent);
+    }
+
+    // 开始读取字幕 (主函数)
+    function startReadingSubtitles() {
+        if (!appContext) return alert('脚本上下文丢失，请刷新页面！');
+
+        subtitlesData = []; // 清空旧数据
+        ui.readButton.disabled = true;
+        ui.readButton.textContent = '正在读取...';
+        ui.progressBarContainer.style.display = 'block';
+        ui.exportSrtButton.style.display = 'none';
+        ui.exportTxtButton.style.display = 'none';
+        ui.progressFill.style.width = '0%';
+        ui.progressText.textContent = '加载进度: 0% (已读取 0 条)';
+
+        const container = appContext.querySelector(YOUR_SELECTOR);
+        if (!container) {
+            alert('错误：未找到字幕容器');
+            resetUI();
+            return;
+        }
+
+        let scriptIsActive = true;
+        let maxScrollTop = 0;
+        const scrollGuard = () => {
+            if (!scriptIsActive) return;
+            if (container.scrollTop > maxScrollTop) {
+                maxScrollTop = container.scrollTop;
+            } else if (container.scrollTop < maxScrollTop) {
+                container.scrollTop = maxScrollTop;
+            }
+        };
+        container.addEventListener('scroll', scrollGuard);
+
+        const allSubtitles = new Map();
+        let lastScrollTop = -1;
+
+        const processAndFinalize = () => {
+            scriptIsActive = false;
+            container.removeEventListener('scroll', scrollGuard);
+
+            subtitlesData = Array.from(allSubtitles.values())
+                .sort((a, b) => a.pid - b.pid || a.sid - b.sid);
+
+            if (subtitlesData.length === 0) {
+                alert('未能读取到任何字幕内容');
+                resetUI();
                 return;
             }
-            finalSRTContent = srtContent;
 
-            ui.exportButton.style.display = 'none';
+            // 读取完成，显示导出选项，并允许重新读取
             ui.progressBarContainer.style.display = 'none';
-            ui.downloadButton.style.display = 'block';
+            ui.exportSrtButton.style.display = 'block';
+            ui.exportTxtButton.style.display = 'block';
+            ui.readButton.textContent = '重新读取字幕';
+            ui.readButton.disabled = false;
+            ui.readButton.style.display = 'block';
         };
 
         const loadContent = () => {
             const totalHeight = container.scrollHeight;
             const viewportHeight = container.clientHeight;
 
-            // 提取当前可见的字幕
             appContext.querySelectorAll('[data-pid]').forEach(paragraph => {
                 const pid = paragraph.getAttribute('data-pid');
                 if (!pid) return;
@@ -178,47 +241,44 @@
                 });
             });
 
-            // 更新进度条
             const progress = Math.min(((container.scrollTop + viewportHeight) / totalHeight) * 100, 100);
             ui.progressFill.style.width = `${progress.toFixed(1)}%`;
-            ui.progressText.textContent = `加载进度: ${progress.toFixed(1)}%`;
+            ui.progressText.textContent = `加载进度: ${progress.toFixed(1)}% (已读取 ${allSubtitles.size} 条)`;
 
-            // 检查是否已滚动到底部 (增加5px的容差) 或滚动位置不再变化
             if ((container.scrollTop + viewportHeight + 5) >= totalHeight || container.scrollTop === lastScrollTop) {
                 console.log('滚动完成。');
                 processAndFinalize();
             } else {
-                // 向下滚动并安排下一次内容提取
                 lastScrollTop = container.scrollTop;
-                container.scrollTop += viewportHeight; // 向下滚动一个视口的高度
-                setTimeout(loadContent, 800); // 等待新内容加载
+                container.scrollTop += viewportHeight;
+                setTimeout(loadContent, 800);
             }
         };
 
-        // **核心修复**：确保从顶部开始
-        // 先强制将滚动条置于顶部，然后等待一段时间让浏览器响应，最后再开始加载。
         console.log('正在重置滚动条到顶部...');
         container.scrollTop = 0;
-
+        maxScrollTop = 0;
         setTimeout(() => {
             console.log(`滚动条已重置, 当前位置: ${container.scrollTop}px. 开始加载字幕.`);
-            // 确认滚动条在顶部后，开始递归加载内容
+            maxScrollTop = container.scrollTop;
             loadContent();
-        }, 500); // 增加延迟以确保滚动操作被浏览器处理
+        }, 500);
     }
 
-    // 下载字幕文件
-    function downloadSRTFile() {
-        if (!finalSRTContent) return alert('没有可下载的SRT内容');
-        const blob = new Blob(['\uFEFF' + finalSRTContent], { type: 'text/plain;charset=utf-8' });
+    // 下载字幕文件 (不再重置UI)
+    function downloadFile(format, content) {
+        if (!content) return alert('没有可下载的内容');
+        const blob = new Blob(['\uFEFF' + content], { type: 'text/plain;charset=utf-8' });
         const url = URL.createObjectURL(blob);
         const a = appContext.createElement('a');
         a.href = url;
-        a.download = `腾讯会议字幕_${new Date().toISOString().slice(0, 19).replace(/[:-]/g, '')}.srt`;
+        const timestamp = new Date().toISOString().slice(0, 19).replace(/[:-]/g, '');
+        a.download = `腾讯会议字幕_${timestamp}.${format}`;
         appContext.body.appendChild(a);
         a.click();
         appContext.body.removeChild(a);
         URL.revokeObjectURL(url);
+        console.log(`${format.toUpperCase()} 文件已导出。`);
     }
 
     // 检测字幕容器并注入UI
@@ -235,7 +295,7 @@
                         targetDoc = iframeDoc;
                         break;
                     }
-                } catch (e) {}
+                } catch (e) { /* 忽略跨域iframe错误 */ }
             }
         }
         if (targetDoc) {
